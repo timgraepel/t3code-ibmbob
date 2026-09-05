@@ -78,6 +78,9 @@ export const ProviderSendTurnInput = Schema.Struct({
   ),
   modelSelection: Schema.optional(ModelSelection),
   interactionMode: Schema.optional(ProviderInteractionMode),
+  /** Path to the selected skill/mode. For Bob Shell built-in modes this is the
+      slug itself (e.g. "ask", "code"). For custom skills it is the SKILL.md path. */
+  skillPath: Schema.optional(Schema.String),
 });
 export type ProviderSendTurnInput = typeof ProviderSendTurnInput.Type;
 

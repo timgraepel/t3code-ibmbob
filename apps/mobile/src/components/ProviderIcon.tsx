@@ -34,6 +34,26 @@ export function ProviderIcon(props: ProviderIconProps) {
     );
   }
 
+  if (props.provider === "bobShell") {
+    return (
+      <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+        <Path
+          d="M4 7l5 5-5 5"
+          stroke={mono}
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+        <Path
+          d="M12 17h8"
+          stroke={mono}
+          strokeWidth="2"
+          strokeLinecap="round"
+        />
+      </Svg>
+    );
+  }
+
   if (props.provider === "grok") {
     const fill = isDarkMode ? "#F5F5F5" : "#0F0F0F";
     return (

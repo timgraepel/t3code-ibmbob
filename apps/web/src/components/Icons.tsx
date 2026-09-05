@@ -676,6 +676,19 @@ export const OpenCodeIcon: Icon = (props) => (
   </svg>
 );
 
+export const BobShellIcon: Icon = ({ className, ...props }) => (
+  <svg
+    {...props}
+    viewBox="0 0 24 24"
+    fill="none"
+    className={cn("fill-black dark:fill-white", className)}
+  >
+    {/* Bob shell ">" prompt glyph */}
+    <path d="M4 7l5 5-5 5" strokeWidth="2" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+    <path d="M12 17h8" strokeWidth="2" stroke="currentColor" strokeLinecap="round" fill="none" />
+  </svg>
+);
+
 export const GithubCopilotIcon: Icon = ({ className, ...props }) => (
   <svg
     {...props}
