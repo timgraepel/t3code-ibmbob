@@ -37,11 +37,7 @@ import {
 } from "../ProviderDriver.ts";
 import { withInstanceIdentity } from "./instanceIdentity.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
-import {
-  makeManualOnlyProviderMaintenanceCapabilities,
-  makeStaticProviderMaintenanceResolver,
-  resolveProviderMaintenanceCapabilitiesEffect,
-} from "../providerMaintenance.ts";
+import { makeManualOnlyProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
 import {
   haveProviderSnapshotSettingsChanged,
   makeProviderSnapshotSettingsSource,
@@ -55,12 +51,10 @@ const decodeSettings = Schema.decodeSync(BobShellSettings);
 const DRIVER_KIND = ProviderDriverKind.make("bobShell");
 
 /** No NPM package or Homebrew formula to check — manual-only updates. */
-const UPDATE = makeStaticProviderMaintenanceResolver(
-  makeManualOnlyProviderMaintenanceCapabilities({
-    provider: DRIVER_KIND,
-    packageName: null,
-  }),
-);
+const MAINTENANCE_CAPABILITIES = makeManualOnlyProviderMaintenanceCapabilities({
+  provider: DRIVER_KIND,
+  packageName: null,
+});
 
 export type BobShellDriverEnv =
   | BackgroundPolicy.BackgroundPolicy
@@ -100,11 +94,6 @@ export const BobShellDriver: ProviderDriver<BobShellSettings, BobShellDriverEnv>
         continuationGroupKey,
       });
 
-      const maintenanceCapabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(UPDATE, {
-        binaryPath: effectiveConfig.binaryPath,
-        env: processEnv,
-      });
-
       const adapter = yield* makeBobShellAdapter(effectiveConfig, {
         instanceId,
         environment: processEnv,
@@ -120,7 +109,7 @@ export const BobShellDriver: ProviderDriver<BobShellSettings, BobShellDriverEnv>
 
       const snapshotSettings = makeProviderSnapshotSettingsSource(effectiveConfig, serverSettings);
       const snapshot = yield* makeManagedServerProvider<ProviderSnapshotSettings<BobShellSettings>>({
-        maintenanceCapabilities,
+        resolveMaintenance: () => Effect.succeed(MAINTENANCE_CAPABILITIES),
         getSettings: snapshotSettings.getSettings,
         streamSettings: snapshotSettings.streamSettings,
         haveSettingsChanged: haveProviderSnapshotSettingsChanged,
@@ -128,7 +117,7 @@ export const BobShellDriver: ProviderDriver<BobShellSettings, BobShellDriverEnv>
           buildInitialBobShellProviderSnapshot(settings.provider).pipe(Effect.map(stampIdentity)),
         checkProvider,
         enrichSnapshot: ({ settings, snapshot: currentSnapshot, publishSnapshot }) =>
-          enrichProviderSnapshotWithVersionAdvisory(currentSnapshot, maintenanceCapabilities, {
+          enrichProviderSnapshotWithVersionAdvisory(currentSnapshot, MAINTENANCE_CAPABILITIES, {
             enableProviderUpdateChecks: settings.enableProviderUpdateChecks,
           }).pipe(
             Effect.provideService(HttpClient.HttpClient, httpClient),

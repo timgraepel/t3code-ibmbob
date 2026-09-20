@@ -854,7 +854,7 @@ export const BobShellSettings = makeProviderSettingsSchema(
       Schema.annotateKey({
         title: "API key",
         description:
-          "Bob Shell API key. When set, passed as BOBSHELL_API_KEY and --auth-method api-key. Leave empty to use browser-based SSO authentication.",
+          "Bob Shell API key. When set, injected as BOBSHELL_API_KEY (Bob reads it automatically). Leave empty to use browser-based SSO authentication.",
         providerSettingsForm: {
           control: "password",
           placeholder: "Optional",

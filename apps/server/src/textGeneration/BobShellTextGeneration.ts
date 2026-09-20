@@ -149,10 +149,8 @@ export const makeBobShellTextGeneration = Effect.fn("makeBobShellTextGeneration"
       if (bobShellSettings.teamId?.trim()) {
         extraArgs.push("--team-id", bobShellSettings.teamId.trim());
       }
-      const apiKey = (bobShellSettings.apiKey ?? "").trim();
-      if (apiKey) {
-        extraArgs.push("--auth-method", "api-key");
-      }
+      // API key is injected via BOBSHELL_API_KEY env var in makeBobShellEnvironment.
+      // bob run has no --auth-method flag.
 
       // Tell Bob Shell to emit structured JSON matching the requested schema.
       const jsonSchemaStr = yield* encodeJsonString(toJsonSchemaObject(outputSchemaJson)).pipe(

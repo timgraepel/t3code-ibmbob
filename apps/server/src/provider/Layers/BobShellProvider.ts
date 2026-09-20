@@ -7,7 +7,8 @@
  *
  * @module provider/Layers/BobShellProvider
  */
-import { type BobShellSettings } from "@t3tools/contracts";
+import { type BobShellSettings, type ServerProviderModel } from "@t3tools/contracts";
+import { createModelCapabilities } from "@t3tools/shared/model";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -32,6 +33,19 @@ const BOB_SHELL_PRESENTATION = {
   showInteractionModeToggle: false,
 } as const;
 
+const EMPTY_CAPABILITIES = createModelCapabilities({ optionDescriptors: [] });
+
+/** The single selectable model Bob Shell exposes. Slug matches DEFAULT_MODEL_BY_PROVIDER["bobShell"]. */
+const BOB_SHELL_BUILT_IN_MODELS: ReadonlyArray<ServerProviderModel> = [
+  {
+    slug: "premium",
+    name: "Bob (auto)",
+    isDefault: true,
+    isCustom: false,
+    capabilities: EMPTY_CAPABILITIES,
+  },
+];
+
 const runBobShellCommand = (
   bobShellSettings: BobShellSettings,
   args: ReadonlyArray<string>,
@@ -55,7 +69,7 @@ export function buildInitialBobShellProviderSnapshot(
 ): Effect.Effect<ServerProviderDraft> {
   return Effect.gen(function* () {
     const checkedAt = DateTime.formatIso(yield* DateTime.now);
-    const models: ReadonlyArray<never> = [];
+    const models = BOB_SHELL_BUILT_IN_MODELS;
 
     if (!settings.enabled) {
       return buildServerProvider({
@@ -98,7 +112,7 @@ export const checkBobShellProviderStatus = Effect.fn("checkBobShellProviderStatu
   ChildProcessSpawner.ChildProcessSpawner | Path.Path
 > {
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
-  const models: ReadonlyArray<never> = [];
+  const models = BOB_SHELL_BUILT_IN_MODELS;
 
   if (!settings.enabled) {
     return buildServerProvider({

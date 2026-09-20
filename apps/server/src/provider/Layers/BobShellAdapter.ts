@@ -1,803 +1,760 @@
 /**
- * BobShellAdapter — provider adapter for Bob Shell v2.
+ * BobShellAdapter — provider adapter for Bob Shell v2 using ACP mode.
  *
- * Each t3code thread maps to a Bob Shell CLI task. Turns are run by
- * spawning `bob run "<prompt>" --format stream-json` in the project
- * working directory. Session continuity across turns uses `--resume <task_id>`,
- * where the task_id comes from the `result` event's `stats.task_id`.
- *
- * Protocol (stream-json events emitted by bob run):
- *   message     → assistant streaming text; `isReasoning: true` marks
- *                 thinking blocks which are suppressed from visible output.
- *                 Role "user" echos are ignored.
- *   tool_use    → item.started; attempt_completion is special-cased to
- *                 publish its parameters.result as the assistant response
- *   tool_result → item.completed
- *   result      → turn.completed (with cost stats, captures task_id for resume)
- *   error       → turn.completed with error state
- *
- * Mode: Bob Shell v2 defaults to `agent` mode with subagents enabled.
- * `--chat-mode` can be overridden via launchArgs. No default override needed.
- *
- * Approval: `--auto-approve` maps to full-access / never-approval-policy.
- * Without it, Bob v2 runs non-interactively but does not prompt (subprocess
- * model is incompatible with interactive approval).
+ * Spawns `bob acp --auto-approve` as a persistent ACP server per thread.
+ * Sessions survive across turns via the ACP session resume cursor.
  *
  * @module provider/Layers/BobShellAdapter
  */
-import * as nodePath from "node:path";
 import {
+  ApprovalRequestId,
+  EventId,
   type BobShellSettings,
+  type ProviderApprovalDecision,
   type ProviderDriverKind,
   type ProviderInstanceId,
-  EventId,
   type ProviderRuntimeEvent,
-  type ProviderSendTurnInput,
   type ProviderSession,
-  type ProviderSessionStartInput,
   type ProviderUserInputAnswers,
-  type CanonicalItemType,
-  RuntimeItemId,
+  RuntimeRequestId,
   type ThreadId,
   TurnId,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as PubSub from "effect/PubSub";
-import * as Stream from "effect/Stream";
 import * as Schema from "effect/Schema";
-import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
-import { resolveSpawnCommand } from "@t3tools/shared/shell";
-import { tokenizeCliArgs } from "@t3tools/shared/cliArgs";
+import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
+import * as Stream from "effect/Stream";
+import * as Option from "effect/Option";
+import * as SynchronizedRef from "effect/SynchronizedRef";
+import * as Layer from "effect/Layer";
+import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
+import * as EffectAcpErrors from "effect-acp/errors";
+import type * as EffectAcpSchema from "effect-acp/schema";
 
+import { buildRuntimeInstructions } from "../RuntimeInstructions.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import {
   ProviderAdapterProcessError,
   ProviderAdapterRequestError,
+  ProviderAdapterSessionClosedError,
   ProviderAdapterSessionNotFoundError,
   ProviderAdapterValidationError,
   type ProviderAdapterError,
 } from "../Errors.ts";
+import { mapAcpToAdapterError } from "../acp/AcpAdapterSupport.ts";
+import * as AcpSessionRuntime from "../acp/AcpSessionRuntime.ts";
+import {
+  makeAcpAssistantItemEvent,
+  makeAcpContentDeltaEvent,
+  makeAcpRequestOpenedEvent,
+  makeAcpRequestResolvedEvent,
+  makeAcpToolCallEvent,
+} from "../acp/AcpCoreRuntimeEvents.ts";
+import { parsePermissionRequest } from "../acp/AcpRuntimeModel.ts";
 import type { ProviderAdapterShape, ProviderThreadSnapshot } from "../Services/ProviderAdapter.ts";
 import type { BobShellAdapterShape } from "../Services/BobShellAdapter.ts";
 import { makeBobShellEnvironment } from "../Drivers/BobShellHome.ts";
 
 const PROVIDER = "bobShell" as ProviderDriverKind;
 
-// ── Bob Shell v2 stream-json event schemas ────────────────────────────────────
+// ── Spawn helpers ─────────────────────────────────────────────────────────────
 
-const BobMessageEvent = Schema.Struct({
-  type: Schema.Literal("message"),
-  role: Schema.String,
-  content: Schema.String,
-  isReasoning: Schema.optional(Schema.Boolean),
-  timestamp: Schema.optional(Schema.String),
-});
-type BobMessageEvent = typeof BobMessageEvent.Type;
+export function buildBobShellAcpSpawnInput(
+  settings: Pick<BobShellSettings, "binaryPath">,
+  cwd: string,
+  environment: NodeJS.ProcessEnv,
+): AcpSessionRuntime.AcpSpawnInput {
+  return {
+    command: settings.binaryPath || "bob",
+    args: ["acp", "--auto-approve"],
+    cwd,
+    env: environment,
+  };
+}
 
-const BobToolUseEvent = Schema.Struct({
-  type: Schema.Literal("tool_use"),
-  tool_name: Schema.String,
-  tool_id: Schema.String,
-  parameters: Schema.Unknown,
-  timestamp: Schema.optional(Schema.String),
-});
-type BobToolUseEvent = typeof BobToolUseEvent.Type;
-
-const BobToolResultEvent = Schema.Struct({
-  type: Schema.Literal("tool_result"),
-  tool_id: Schema.String,
-  status: Schema.String,
-  output: Schema.optional(Schema.String),
-  error: Schema.optional(Schema.Unknown),
-  timestamp: Schema.optional(Schema.String),
-});
-type BobToolResultEvent = typeof BobToolResultEvent.Type;
-
-const BobResultStats = Schema.Struct({
-  task_id: Schema.optional(Schema.String),
-  duration_ms: Schema.optional(Schema.Number),
-  session_costs: Schema.optional(Schema.Number),
-  tool_calls: Schema.optional(Schema.Number),
-  // Token fields are only present in dev mode
-  total_tokens: Schema.optional(Schema.Number),
-  input_tokens: Schema.optional(Schema.Number),
-  output_tokens: Schema.optional(Schema.Number),
-});
-
-const BobResultEvent = Schema.Struct({
-  type: Schema.Literal("result"),
-  status: Schema.String,
-  stats: Schema.optional(BobResultStats),
-  timestamp: Schema.optional(Schema.String),
-});
-type BobResultEvent = typeof BobResultEvent.Type;
-
-const BobErrorEvent = Schema.Struct({
-  type: Schema.Literal("error"),
-  severity: Schema.optional(Schema.String),
-  message: Schema.String,
-  timestamp: Schema.optional(Schema.String),
-});
-type BobErrorEvent = typeof BobErrorEvent.Type;
-
-const BobUnknownEvent = Schema.Struct({ type: Schema.String });
-
-const BobStreamEvent = Schema.Union([
-  BobMessageEvent,
-  BobToolUseEvent,
-  BobToolResultEvent,
-  BobResultEvent,
-  BobErrorEvent,
-  BobUnknownEvent,
-]);
-
-const decodeBobStreamEvent = Schema.decodeUnknownOption(Schema.fromJsonString(BobStreamEvent));
+function resolveAuthMethodId(settings: Pick<BobShellSettings, "apiKey">): string {
+  return (settings.apiKey ?? "").trim() ? "api_key" : "sso";
+}
 
 // ── Per-thread session state ──────────────────────────────────────────────────
 
-interface BobShellSessionState {
-  readonly threadId: ThreadId;
-  readonly cwd: string;
-  /** Populated from result.stats.task_id — used for --resume on next turn. */
-  bobTaskId: string | undefined;
-  readonly toolItemTypes: Map<string, CanonicalItemType>;
-  activeTurnId: TurnId | undefined;
-  activeFiber: Fiber.Fiber<void, unknown> | undefined;
-  activeChildProcess: ChildProcessSpawner.ChildProcessHandle | undefined;
-  interruptRef: Deferred.Deferred<void, void> | undefined;
-  readonly runtimeMode: ProviderSessionStartInput["runtimeMode"];
-  readonly createdAt: string;
+interface PendingApproval {
+  readonly request: EffectAcpSchema.RequestPermissionRequest;
+  readonly response: Deferred.Deferred<{
+    readonly decision: ProviderApprovalDecision;
+    readonly result: EffectAcpSchema.RequestPermissionResponse;
+  }>;
 }
 
-function classifyToolItemType(toolName: string): CanonicalItemType {
-  const normalized = toolName.toLowerCase();
-  if (normalized.includes("subagent") || normalized.includes("agent")) {
-    return "collab_agent_tool_call";
-  }
-  if (normalized.includes("mcp")) {
-    return "mcp_tool_call";
-  }
-  if (
-    normalized.includes("bash") ||
-    normalized.includes("command") ||
-    normalized.includes("shell")
-  ) {
-    return "command_execution";
-  }
-  if (
-    normalized.includes("edit") ||
-    normalized.includes("write") ||
-    normalized.includes("patch") ||
-    normalized.includes("replace") ||
-    normalized.includes("create") ||
-    normalized.includes("delete")
-  ) {
-    return "file_change";
-  }
-  if (normalized.includes("image")) {
-    return "image_view";
-  }
-  if (normalized.includes("websearch") || normalized.includes("web_search")) {
-    return "web_search";
-  }
-  return "dynamic_tool_call";
+interface PendingQuestion {
+  readonly request: EffectAcpSchema.RequestPermissionRequest;
+  readonly response: Deferred.Deferred<{
+    readonly answers: ProviderUserInputAnswers;
+    readonly result: EffectAcpSchema.RequestPermissionResponse;
+  }>;
 }
+
+interface SessionContext {
+  readonly threadId: ThreadId;
+  readonly cwd: string;
+  readonly nativeSessionId: string;
+  readonly scope: Scope.Closeable;
+  readonly runtime: AcpSessionRuntime.AcpSessionRuntime["Service"];
+  readonly promptLock: Semaphore.Semaphore;
+  readonly stopLock: Semaphore.Semaphore;
+  readonly approvals: Map<ApprovalRequestId, PendingApproval>;
+  readonly questions: Map<ApprovalRequestId, PendingQuestion>;
+  readonly turns: Array<{ id: TurnId; items: Array<unknown> }>;
+  session: ProviderSession;
+  activeTurnId: TurnId | undefined;
+  promptFiber: Fiber.Fiber<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError> | undefined;
+  generation: number;
+  stopped: boolean;
+  closed: boolean;
+  disconnected: boolean;
+}
+
+interface TurnIntent {
+  readonly turnId: TurnId;
+  readonly generation: number;
+  settled: boolean;
+}
+
+const ResumeCursor = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  sessionId: Schema.NonEmptyString,
+});
+const decodeResumeCursor = Schema.decodeUnknownOption(ResumeCursor);
+const isAcpError = Schema.is(EffectAcpErrors.AcpError);
 
 // ── Adapter factory ───────────────────────────────────────────────────────────
 
 export const makeBobShellAdapter = Effect.fn("makeBobShellAdapter")(function* (
-  bobShellSettings: BobShellSettings,
+  settings: BobShellSettings,
   options: {
     readonly instanceId: ProviderInstanceId;
     readonly environment: NodeJS.ProcessEnv;
   },
 ) {
-  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const crypto = yield* Crypto.Crypto;
-  const bobEnvironment = yield* makeBobShellEnvironment(bobShellSettings, options.environment);
-  // Capture the adapter's own scope so turn fibers outlive the sendTurn call.
-  const adapterScope = yield* Effect.scope;
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const ownerScope = yield* Effect.scope;
 
-  const sessions = new Map<string, BobShellSessionState>();
-  const eventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
-  const publish = (event: ProviderRuntimeEvent) => PubSub.publish(eventPubSub, event);
+  const bobEnvironment = yield* makeBobShellEnvironment(settings, options.environment);
 
-  // ── Event helpers ──────────────────────────────────────────────────────────
+  const sessions = new Map<ThreadId, SessionContext>();
+  const locks = yield* SynchronizedRef.make(new Map<ThreadId, Semaphore.Semaphore>());
+  const events = yield* PubSub.unbounded<ProviderRuntimeEvent>();
 
-  const makeBase = (threadId: ThreadId, turnId?: TurnId) =>
+  const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
+  const randomId = crypto.randomUUIDv4.pipe(
+    Effect.mapError(
+      (cause) =>
+        new ProviderAdapterRequestError({
+          provider: PROVIDER,
+          method: "crypto/randomUUIDv4",
+          detail: "Could not create a Bob Shell event ID.",
+          cause,
+        }),
+    ),
+  );
+  const stamp = Effect.all({
+    eventId: Effect.map(randomId, EventId.make),
+    createdAt: nowIso,
+  });
+  const emit = (event: ProviderRuntimeEvent) => PubSub.publish(events, event).pipe(Effect.asVoid);
+
+  const withThreadLock = <A, E, R>(threadId: ThreadId, task: Effect.Effect<A, E, R>) =>
+    SynchronizedRef.modifyEffect(locks, (current) => {
+      const existing = current.get(threadId);
+      if (existing) return Effect.succeed([existing, current] as const);
+      return Semaphore.make(1).pipe(
+        Effect.map((lock) => [lock, new Map(current).set(threadId, lock)] as const),
+      );
+    }).pipe(Effect.flatMap((lock) => lock.withPermit(task)));
+
+  const requireSession = (threadId: ThreadId) => {
+    const context = sessions.get(threadId);
+    return context && !context.stopped
+      ? Effect.succeed(context)
+      : Effect.fail(new ProviderAdapterSessionNotFoundError({ provider: PROVIDER, threadId }));
+  };
+
+  const cancelRequests = (context: SessionContext) =>
     Effect.gen(function* () {
-      const rawId = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
-      const now = yield* DateTime.now.pipe(Effect.orDie);
-      return {
-        eventId: EventId.make(rawId),
-        provider: PROVIDER,
-        providerInstanceId: options.instanceId,
-        threadId,
-        createdAt: DateTime.formatIso(now),
-        ...(turnId ? { turnId } : {}),
-      } as const;
+      for (const pending of context.approvals.values()) {
+        yield* Deferred.succeed(pending.response, {
+          decision: "cancel",
+          result: { outcome: { outcome: "cancelled" } },
+        });
+      }
+      for (const pending of context.questions.values()) {
+        yield* Deferred.succeed(pending.response, {
+          answers: {},
+          result: { outcome: { outcome: "cancelled" } },
+        });
+      }
     });
 
-  // ── Turn runner ────────────────────────────────────────────────────────────
-
-  const runTurn = (
-    session: BobShellSessionState,
-    turnId: TurnId,
-    prompt: string,
-    skillPath: string | undefined,
-  ): Effect.Effect<void, ProviderAdapterError> =>
-    Effect.gen(function* () {
-      const binary = bobShellSettings.binaryPath || "bob";
-      const extraArgs: string[] = [];
-
-      if (bobShellSettings.teamId.trim()) {
-        extraArgs.push("--team-id", bobShellSettings.teamId.trim());
-      }
-      const apiKey = (bobShellSettings.apiKey ?? "").trim();
-      if (apiKey) {
-        extraArgs.push("--auth-method", "api-key");
-      }
-      if (session.bobTaskId) {
-        extraArgs.push("--resume", session.bobTaskId);
-      }
-
-      // Extra launch args from settings (e.g. --max-cost 2)
-      const launchArgTokens = tokenizeCliArgs(bobShellSettings.launchArgs);
-
-      // If a skill is selected via skillPath, use it as the --chat-mode value.
-      // Bob built-in modes use their slug as path; custom skills use directory name.
-      const selectedSkillArg: string[] = [];
-      if (skillPath?.trim()) {
-        const skillSlug = nodePath.basename(nodePath.dirname(skillPath)) || skillPath;
-        selectedSkillArg.push(`--chat-mode=${skillSlug}`);
-      }
-      // Default to --chat-mode=agent only if no skill selected and user hasn't overridden via launchArgs
-      const modeArgs =
-        selectedSkillArg.length > 0 ||
-        launchArgTokens.includes("--chat-mode") ||
-        launchArgTokens.some((t) => t.startsWith("--chat-mode="))
-          ? selectedSkillArg
-          : ["--chat-mode=agent"];
-
-      const spawnCommand = yield* resolveSpawnCommand(
-        binary,
-        [
-          "run",
-          "--auto-approve",
-          "--format",
-          "stream-json",
-          ...modeArgs,
-          ...extraArgs,
-          ...launchArgTokens,
-          prompt,
-        ],
-        { env: bobEnvironment },
-      ).pipe(
-        Effect.mapError(
-          (cause) =>
-            new ProviderAdapterProcessError({
-              provider: PROVIDER,
-              threadId: session.threadId,
-              detail: "Failed to resolve Bob Shell spawn command.",
-              cause,
-            }),
-        ),
-      );
-
-      const command = ChildProcess.make(spawnCommand.command, spawnCommand.args, {
-        env: bobEnvironment,
-        cwd: session.cwd,
-        shell: spawnCommand.shell,
-      });
-
-      const child = yield* spawner.spawn(command).pipe(
-        Effect.tapError((cause) => Effect.logWarning("Bob Shell process spawn failed", { cause })),
-        Effect.mapError(
-          (cause) =>
-            new ProviderAdapterProcessError({
-              provider: PROVIDER,
-              threadId: session.threadId,
-              detail: "Failed to spawn Bob Shell process.",
-              cause,
-            }),
-        ),
-      );
-
-      session.activeChildProcess = child;
-
-      // Emit turn.started
-      const turnBase = yield* makeBase(session.threadId, turnId);
-      yield* publish({
-        ...turnBase,
-        type: "turn.started",
-        payload: {},
-      } satisfies ProviderRuntimeEvent);
-
-      const textItemId = RuntimeItemId.make(`bob-text-${turnId}`);
-      let textItemStarted = false;
-      let turnEnded = false;
-
-      // Capture stderr lines for error reporting
-      const stderrChunks: string[] = [];
-      const processStderr = child.stderr.pipe(
-        Stream.runForEach((chunk) =>
-          Effect.sync(() => {
-            const text = typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
-            for (const line of text.split("\n")) {
-              const trimmed = line.trim();
-              if (trimmed) {
-                stderrChunks.push(trimmed);
-              }
+  const stopContext = (context: SessionContext) =>
+    context.stopLock
+      .withPermit(
+        Effect.gen(function* () {
+          if (context.closed) return;
+          context.stopped = true;
+          yield* Effect.gen(function* () {
+            yield* cancelRequests(context);
+            if (context.promptFiber && !context.disconnected) {
+              yield* Effect.ignore(context.runtime.cancel);
             }
-          }),
-        ),
-        Effect.ignore,
-      );
-
-      // Process stdout line by line
-      const processStdout = child.stdout.pipe(
-        Stream.runForEach((chunk) =>
-          Effect.gen(function* () {
-            const text = typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
-            for (const line of text.split("\n")) {
-              const trimmed = line.trim();
-              if (!trimmed || turnEnded) continue;
-              const maybeEvent = decodeBobStreamEvent(trimmed);
-              if (maybeEvent._tag !== "Some") {
-                yield* Effect.logDebug("BobShell: unrecognized stdout line", { line: trimmed });
-                continue;
-              }
-              const event = maybeEvent.value as typeof BobStreamEvent.Type;
-
-              const base = yield* makeBase(session.threadId, turnId);
-
-              if (event.type === "message") {
-                const msgEv = event as BobMessageEvent;
-                // Skip user-echo messages and thinking/reasoning blocks
-                if (msgEv.role !== "assistant" || !msgEv.content) continue;
-                // Bob v2 internal reasoning/thinking blocks are not surfaced to the user.
-                // Unlike Claude's extended thinking (which is a deliberate user feature),
-                // Bob's reasoning is internal scaffolding. Suppress silently.
-                if (msgEv.isReasoning) continue;
-                const content = msgEv.content;
-                if (/^\[using tool /i.test(content)) continue;
-                if (!textItemStarted) {
-                  textItemStarted = true;
-                  yield* publish({
-                    ...base,
-                    itemId: textItemId,
-                    type: "item.started",
-                    payload: { itemType: "assistant_message", title: "Response" },
-                  } satisfies ProviderRuntimeEvent);
-                }
-                yield* publish({
-                  ...base,
-                  itemId: textItemId,
-                  type: "content.delta",
-                  payload: { streamKind: "assistant_text", delta: content },
-                } satisfies ProviderRuntimeEvent);
-              } else if (event.type === "tool_use") {
-                const toolEv = event as BobToolUseEvent;
-                if (toolEv.tool_name === "attempt_completion") {
-                  const params = toolEv.parameters as Record<string, unknown> | null | undefined;
-                  const result = typeof params?.result === "string" ? params.result : undefined;
-                  if (result) {
-                    if (!textItemStarted) {
-                      textItemStarted = true;
-                      yield* publish({
-                        ...base,
-                        itemId: textItemId,
-                        type: "item.started",
-                        payload: { itemType: "assistant_message", title: "Response" },
-                      } satisfies ProviderRuntimeEvent);
-                    }
-                    yield* publish({
-                      ...base,
-                      itemId: textItemId,
-                      type: "content.delta",
-                      payload: { streamKind: "assistant_text", delta: result },
-                    } satisfies ProviderRuntimeEvent);
-                  }
-                  continue;
-                }
-                const toolItemId = RuntimeItemId.make(toolEv.tool_id);
-                const itemType = classifyToolItemType(toolEv.tool_name);
-                session.toolItemTypes.set(toolEv.tool_id, itemType);
-                const params = toolEv.parameters as Record<string, unknown> | null | undefined;
-                const isSubagent = toolEv.tool_name === "spawn_subagent";
-                const subagentName = typeof params?.name === "string" ? params.name : undefined;
-                const subagentDesc =
-                  typeof params?.description === "string" ? params.description : undefined;
-                const toolTitle = isSubagent
-                  ? `Subagent${subagentName ? ` (${subagentName})` : ""}`
-                  : toolEv.tool_name;
-                yield* publish({
-                  ...base,
-                  itemId: toolItemId,
-                  type: "item.started",
-                  payload: {
-                    itemType,
-                    title: toolTitle,
-                    status: "inProgress",
-                    ...(isSubagent && subagentDesc ? { detail: subagentDesc } : {}),
-                    data: {
-                      toolName: toolEv.tool_name,
-                      parameters: toolEv.parameters,
-                    },
-                  },
-                } satisfies ProviderRuntimeEvent);
-              } else if (event.type === "tool_result") {
-                const resEv = event as BobToolResultEvent;
-                const toolItemId = RuntimeItemId.make(resEv.tool_id);
-                yield* publish({
-                  ...base,
-                  itemId: toolItemId,
-                  type: "item.completed",
-                  payload: {
-                    itemType: session.toolItemTypes.get(resEv.tool_id) ?? "dynamic_tool_call",
-                    status: resEv.status === "success" ? "completed" : "failed",
-                    ...(resEv.output ? { detail: resEv.output } : {}),
-                    data: {
-                      status: resEv.status,
-                      ...(resEv.output !== undefined ? { output: resEv.output } : {}),
-                    },
-                  },
-                } satisfies ProviderRuntimeEvent);
-              } else if (event.type === "result") {
-                const resEv = event as BobResultEvent;
-                turnEnded = true;
-                // Capture task_id for --resume on the next turn
-                if (resEv.stats?.task_id) {
-                  session.bobTaskId = resEv.stats.task_id;
-                }
-                session.activeTurnId = undefined;
-                session.activeChildProcess = undefined;
-
-                if (resEv.stats) {
-                  const usedTokens = resEv.stats.total_tokens ?? 0;
-                  if (usedTokens > 0 || resEv.stats.input_tokens !== undefined) {
-                    yield* publish({
-                      ...base,
-                      type: "thread.token-usage.updated",
-                      payload: {
-                        usage: {
-                          usedTokens,
-                          ...(resEv.stats.total_tokens !== undefined
-                            ? { totalProcessedTokens: resEv.stats.total_tokens }
-                            : {}),
-                          ...(resEv.stats.input_tokens !== undefined
-                            ? { inputTokens: resEv.stats.input_tokens }
-                            : {}),
-                          ...(resEv.stats.output_tokens !== undefined
-                            ? { outputTokens: resEv.stats.output_tokens }
-                            : {}),
-                          ...(resEv.stats.duration_ms !== undefined
-                            ? { durationMs: resEv.stats.duration_ms }
-                            : {}),
-                        },
-                      },
-                    } satisfies ProviderRuntimeEvent);
-                  }
-                }
-
-                if (textItemStarted) {
-                  yield* publish({
-                    ...base,
-                    itemId: textItemId,
-                    type: "item.completed",
-                    payload: { itemType: "assistant_message", status: "completed" },
-                  } satisfies ProviderRuntimeEvent);
-                }
-                yield* publish({
-                  ...base,
-                  type: "turn.completed",
-                  payload: {
-                    state: resEv.status === "success" ? "completed" : "failed",
-                    stopReason: resEv.status,
-                    ...(resEv.stats?.session_costs !== undefined
-                      ? { totalCostUsd: resEv.stats.session_costs }
-                      : {}),
-                  },
-                } satisfies ProviderRuntimeEvent);
-              } else if (event.type === "error") {
-                const errEv = event as BobErrorEvent;
-                turnEnded = true;
-                session.activeTurnId = undefined;
-                session.activeChildProcess = undefined;
-
-                yield* publish({
-                  ...base,
-                  itemId: RuntimeItemId.make(`bob-err-${turnId}`),
-                  type: "item.completed",
-                  payload: {
-                    itemType: "error",
-                    status: "failed",
-                    title: "Bob Shell error",
-                    detail: errEv.message,
-                  },
-                } satisfies ProviderRuntimeEvent);
-                yield* publish({
-                  ...base,
-                  type: "turn.completed",
-                  payload: { state: "failed", stopReason: "error" },
-                } satisfies ProviderRuntimeEvent);
-              } else {
-                yield* Effect.logDebug("BobShell: unhandled stream event type", {
-                  type: (event as { type: string }).type,
-                });
-              }
-            }
-          }),
-        ),
-        Effect.mapError(
-          (cause) =>
-            new ProviderAdapterProcessError({
-              provider: PROVIDER,
-              threadId: session.threadId,
-              detail: "Bob Shell stdout processing failed.",
-              cause,
-            }),
-        ),
-      );
-
-      const [, , exitCode] = yield* Effect.all(
-        [
-          processStdout,
-          processStderr,
-          child.exitCode.pipe(
-            Effect.mapError(
-              (cause) =>
-                new ProviderAdapterProcessError({
-                  provider: PROVIDER,
-                  threadId: session.threadId,
-                  detail: "Failed to read Bob Shell exit code.",
-                  cause,
-                }),
-            ),
-          ),
-        ] as const,
-        { concurrency: "unbounded" },
-      );
-
-      session.activeChildProcess = undefined;
-
-      if (!turnEnded) {
-        const base = yield* makeBase(session.threadId, turnId);
-        const stderrDetail = stderrChunks.length > 0 ? stderrChunks.join("\n") : undefined;
-
-        if (exitCode !== 0 && stderrDetail) {
-          yield* publish({
-            ...base,
-            itemId: RuntimeItemId.make(`bob-err-${turnId}`),
-            type: "item.completed",
+          }).pipe(Effect.ensuring(Scope.close(context.scope, Exit.void)));
+          context.closed = true;
+          if (sessions.get(context.threadId) === context) sessions.delete(context.threadId);
+          yield* emit({
+            type: "session.exited",
+            ...(yield* stamp),
+            provider: PROVIDER,
+            threadId: context.threadId,
             payload: {
-              itemType: "error",
-              status: "failed",
-              title: "Bob Shell process error",
-              detail: stderrDetail,
+              exitKind: context.disconnected ? "error" : "graceful",
+              ...(context.disconnected ? { reason: "Bob Shell process stopped." } : {}),
             },
-          } satisfies ProviderRuntimeEvent);
-        }
+          });
+        }),
+      )
+      .pipe(Effect.uninterruptible);
 
-        yield* publish({
-          ...base,
-          type: "turn.completed",
-          payload: {
-            state: exitCode === 0 ? "completed" : "failed",
-            stopReason: exitCode !== 0 ? `exit_code_${exitCode}` : "end_turn",
-          },
-        } satisfies ProviderRuntimeEvent);
-      }
-    }).pipe(Effect.scoped);
+  const handlePermission = Effect.fn("BobShellAdapter.handlePermission")(function* (
+    context: SessionContext,
+    request: EffectAcpSchema.RequestPermissionRequest,
+  ): Effect.fn.Return<EffectAcpSchema.RequestPermissionResponse, ProviderAdapterError> {
+    if (context.stopped || request.sessionId !== context.nativeSessionId) {
+      return { outcome: { outcome: "cancelled" } };
+    }
+    const requestId = ApprovalRequestId.make(yield* randomId);
+    const runtimeRequestId = RuntimeRequestId.make(requestId);
+    const turnId = context.activeTurnId;
 
-  // ── Adapter operations ─────────────────────────────────────────────────────
+    const response = yield* Deferred.make<{
+      decision: ProviderApprovalDecision;
+      result: EffectAcpSchema.RequestPermissionResponse;
+    }>();
+    context.approvals.set(requestId, { request, response });
+    const parsed = parsePermissionRequest(request);
+    return yield* Effect.gen(function* () {
+      yield* emit(
+        makeAcpRequestOpenedEvent({
+          stamp: yield* stamp,
+          provider: PROVIDER,
+          threadId: context.threadId,
+          turnId,
+          requestId: runtimeRequestId,
+          permissionRequest: parsed,
+          detail: parsed.toolCall?.command ?? parsed.toolCall?.title ?? "Bob requests permission.",
+          args: request,
+          source: "acp.jsonrpc",
+          method: "session/request_permission",
+          rawPayload: request,
+        }),
+      );
+      const answer = yield* Deferred.await(response);
+      yield* emit(
+        makeAcpRequestResolvedEvent({
+          stamp: yield* stamp,
+          provider: PROVIDER,
+          threadId: context.threadId,
+          turnId,
+          requestId: runtimeRequestId,
+          permissionRequest: parsed,
+          decision: answer.decision,
+        }),
+      );
+      return answer.result;
+    }).pipe(Effect.ensuring(Effect.sync(() => context.approvals.delete(requestId))));
+  });
+
+  const handleEvent = Effect.fn("BobShellAdapter.handleEvent")(function* (
+    context: SessionContext,
+    event: AcpSessionRuntime.AcpSessionRuntimeEvent,
+  ) {
+    if (event._tag === "EventStreamBarrier") {
+      yield* Deferred.succeed(event.acknowledge, undefined);
+      return;
+    }
+    if (context.stopped) return;
+    switch (event._tag) {
+      case "ModeChanged":
+      case "ConfigOptionsUpdated":
+        return;
+      case "AvailableCommandsUpdated":
+        return;
+      case "ConnectionTerminated":
+        context.stopped = true;
+        context.disconnected = true;
+        yield* stopContext(context).pipe(Effect.forkIn(ownerScope));
+        return;
+      case "AssistantItemStarted":
+      case "AssistantItemCompleted":
+        yield* emit(
+          makeAcpAssistantItemEvent({
+            stamp: yield* stamp,
+            provider: PROVIDER,
+            threadId: context.threadId,
+            turnId: context.activeTurnId,
+            itemId: event.itemId,
+            lifecycle: event._tag === "AssistantItemStarted" ? "item.started" : "item.completed",
+          }),
+        );
+        return;
+      case "ThoughtDelta":
+      case "ContentDelta":
+        yield* emit(
+          makeAcpContentDeltaEvent({
+            stamp: yield* stamp,
+            provider: PROVIDER,
+            threadId: context.threadId,
+            turnId: context.activeTurnId,
+            ...(event._tag === "ContentDelta" && event.itemId ? { itemId: event.itemId } : {}),
+            ...(event._tag === "ThoughtDelta" ? { streamKind: "reasoning_text" } : {}),
+            text: event.text,
+            rawPayload: event.rawPayload,
+          }),
+        );
+        return;
+      case "PlanUpdated":
+        return;
+      case "ToolCallUpdated":
+        yield* emit(
+          makeAcpToolCallEvent({
+            stamp: yield* stamp,
+            provider: PROVIDER,
+            threadId: context.threadId,
+            turnId: context.activeTurnId,
+            toolCall: event.toolCall,
+            rawPayload: event.rawPayload,
+          }),
+        );
+        return;
+    }
+  });
 
   const startSession: ProviderAdapterShape<ProviderAdapterError>["startSession"] = (input) =>
-    Effect.gen(function* () {
-      const base = yield* makeBase(input.threadId);
-      const now = base.createdAt;
+    withThreadLock(
+      input.threadId,
+      Effect.gen(function* () {
+        if (!settings.enabled) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "startSession",
+            issue: "Enable Bob Shell in provider settings before starting a thread.",
+          });
+        }
+        if (!input.cwd?.trim()) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "startSession",
+            issue: "The session requires a workspace directory.",
+          });
+        }
+        const cursor = decodeResumeCursor(input.resumeCursor);
+        if (input.resumeCursor !== undefined && Option.isNone(cursor)) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "startSession",
+            issue: "The saved Bob Shell session is invalid. Start a new thread.",
+          });
+        }
+        const previous = sessions.get(input.threadId);
+        if (previous) yield* stopContext(previous);
+        const cwd = input.cwd.trim();
+        const sessionScope = yield* Scope.make("sequential");
+        let transferred = false;
+        let context: SessionContext | undefined;
+        yield* Effect.addFinalizer(() => {
+          if (transferred) return Effect.void;
+          sessions.delete(input.threadId);
+          return Scope.close(sessionScope, Exit.void);
+        });
 
-      if (sessions.has(input.threadId)) {
-        const existing = sessions.get(input.threadId)!;
-        yield* publish({
-          ...base,
-          type: "session.started",
-          payload: { ...(existing.bobTaskId ? { resume: existing.bobTaskId } : {}) },
-        } satisfies ProviderRuntimeEvent);
-        return {
+        const mcp = McpProviderSession.readMcpProviderSession(input.threadId);
+        const spawnInput = buildBobShellAcpSpawnInput(settings, cwd, bobEnvironment);
+        const resumeSessionId =
+          Option.isSome(cursor) ? cursor.value.sessionId : undefined;
+        const runtime = yield* Effect.gen(function* () {
+          const acpContext = yield* Layer.build(
+            AcpSessionRuntime.layer({
+              spawn: spawnInput,
+              cwd,
+              clientInfo: { name: "t3-code", version: "0.0.0" },
+              authMethodId: resolveAuthMethodId(settings),
+              ...(resumeSessionId ? { resumeSessionId } : {}),
+              ...(mcp
+                ? {
+                    mcpServers: [
+                      {
+                        type: "http" as const,
+                        name: "t3-code",
+                        url: mcp.endpoint,
+                        headers: [{ name: "Authorization", value: mcp.authorizationHeader }],
+                      },
+                    ],
+                  }
+                : {}),
+            }).pipe(
+              Layer.provide(
+                Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner),
+              ),
+            ),
+          );
+          return yield* Effect.service(AcpSessionRuntime.AcpSessionRuntime).pipe(
+            Effect.provide(acpContext),
+          );
+        }).pipe(
+          Effect.provideService(Scope.Scope, sessionScope),
+          Effect.provideService(Crypto.Crypto, crypto),
+          Effect.mapError(
+            (cause) =>
+              new ProviderAdapterProcessError({
+                provider: PROVIDER,
+                threadId: input.threadId,
+                detail: "Failed to build Bob Shell ACP runtime.",
+                cause,
+              }),
+          ),
+        );
+
+        yield* runtime.handleRequestPermission((request) =>
+          context
+            ? handlePermission(context, request).pipe(
+                Effect.mapError((cause) =>
+                  EffectAcpErrors.AcpRequestError.internalError(
+                    "Could not process a Bob Shell permission request.",
+                    undefined,
+                    { cause },
+                  ),
+                ),
+              )
+            : Effect.succeed({ outcome: { outcome: "cancelled" } } satisfies EffectAcpSchema.RequestPermissionResponse),
+        );
+
+        const started = yield* runtime.start().pipe(
+          Effect.mapError((cause) =>
+            isAcpError(cause)
+              ? mapAcpToAdapterError(PROVIDER, input.threadId, "session/start", cause)
+              : new ProviderAdapterProcessError({
+                  provider: PROVIDER,
+                  threadId: input.threadId,
+                  detail: "Failed to start Bob Shell ACP session.",
+                  cause,
+                }),
+          ),
+        );
+
+        const createdAt = yield* nowIso;
+        const session: ProviderSession = {
           provider: PROVIDER,
           providerInstanceId: options.instanceId,
+          threadId: input.threadId,
+          cwd,
           status: "ready",
           runtimeMode: input.runtimeMode,
-          cwd: existing.cwd,
+          resumeCursor: { schemaVersion: 1, sessionId: started.sessionId },
+          createdAt,
+          updatedAt: createdAt,
+        };
+        context = {
           threadId: input.threadId,
-          createdAt: existing.createdAt,
-          updatedAt: now,
-        } satisfies ProviderSession;
-      }
-
-      const cwd = input.cwd ?? process.cwd();
-      const state: BobShellSessionState = {
-        threadId: input.threadId,
-        cwd,
-        bobTaskId: undefined,
-        toolItemTypes: new Map(),
-        activeTurnId: undefined,
-        activeFiber: undefined,
-        activeChildProcess: undefined,
-        interruptRef: undefined,
-        runtimeMode: input.runtimeMode,
-        createdAt: now,
-      };
-      sessions.set(input.threadId, state);
-
-      yield* publish({
-        ...base,
-        type: "thread.started",
-        payload: {},
-      } satisfies ProviderRuntimeEvent);
-      yield* publish({
-        ...base,
-        type: "session.started",
-        payload: {},
-      } satisfies ProviderRuntimeEvent);
-
-      return {
-        provider: PROVIDER,
-        providerInstanceId: options.instanceId,
-        status: "ready",
-        runtimeMode: input.runtimeMode,
-        cwd,
-        threadId: input.threadId,
-        createdAt: now,
-        updatedAt: now,
-      } satisfies ProviderSession;
-    }).pipe(Effect.mapError((e) => e as ProviderAdapterError));
-
-  const sendTurn: ProviderAdapterShape<ProviderAdapterError>["sendTurn"] = (input) =>
-    Effect.gen(function* () {
-      const session = sessions.get(input.threadId);
-      if (!session) {
-        return yield* new ProviderAdapterSessionNotFoundError({
+          cwd,
+          nativeSessionId: started.sessionId,
+          scope: sessionScope,
+          runtime,
+          promptLock: yield* Semaphore.make(1),
+          stopLock: yield* Semaphore.make(1),
+          approvals: new Map(),
+          questions: new Map(),
+          turns: [],
+          session,
+          activeTurnId: undefined,
+          promptFiber: undefined,
+          generation: 0,
+          stopped: false,
+          closed: false,
+          disconnected: false,
+        };
+        const running = context;
+        sessions.set(input.threadId, running);
+        yield* Stream.runForEach(runtime.getEvents(), (event) =>
+          handleEvent(running, event),
+        ).pipe(
+          Effect.catchCause(() => Effect.logError("Could not process a Bob Shell runtime event.")),
+          Effect.forkIn(sessionScope),
+        );
+        yield* emit({
+          type: "thread.started",
+          ...(yield* stamp),
           provider: PROVIDER,
           threadId: input.threadId,
+          payload: { providerThreadId: started.sessionId },
         });
-      }
-      if (!input.input && !input.continuation) {
-        return yield* new ProviderAdapterValidationError({
+        yield* emit({
+          type: "session.started",
+          ...(yield* stamp),
           provider: PROVIDER,
-          operation: "sendTurn",
-          issue: "Bob Shell requires a non-empty prompt.",
+          threadId: input.threadId,
+          payload: { resume: started.initializeResult },
         });
-      }
+        yield* runtime.drainEvents;
+        if (running.stopped) {
+          return yield* new ProviderAdapterSessionClosedError({
+            provider: PROVIDER,
+            threadId: input.threadId,
+          });
+        }
+        transferred = true;
+        return session;
+      }).pipe(Effect.scoped),
+    );
 
-      const uuid = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
-      const turnId = TurnId.make(`bob-turn-${uuid}`);
-      const prompt = input.input ?? "";
+  const sendTurn: ProviderAdapterShape<ProviderAdapterError>["sendTurn"] = Effect.fn(
+    "BobShellAdapter.sendTurn",
+  )(function* (input) {
+    const context = yield* requireSession(input.threadId);
+    const promptText = input.input ?? "";
+    let intent: TurnIntent | undefined;
 
-      session.activeTurnId = turnId;
-      const interrupt = yield* Deferred.make<void, void>();
-      session.interruptRef = interrupt;
+    const finishTurn = (
+      turn: TurnIntent,
+      payload: {
+        state: "completed" | "failed" | "cancelled";
+        stopReason?: string | null;
+        errorMessage?: string;
+      },
+    ) =>
+      Effect.gen(function* () {
+        if (turn.settled || context.stopped || context.generation !== turn.generation) return;
+        turn.settled = true;
+        context.activeTurnId = undefined;
+        context.promptFiber = undefined;
+        context.session = {
+          ...context.session,
+          status: payload.state === "failed" ? "error" : "ready",
+          activeTurnId: undefined,
+          updatedAt: yield* nowIso,
+          ...(payload.errorMessage ? { lastError: payload.errorMessage } : { lastError: undefined }),
+        };
+        yield* emit({
+          type: "turn.completed",
+          ...(yield* stamp),
+          provider: PROVIDER,
+          threadId: input.threadId,
+          turnId: turn.turnId,
+          payload,
+        });
+      }).pipe(Effect.uninterruptible);
 
-      const turnFiber = yield* runTurn(session, turnId, prompt, input.skillPath).pipe(
-        Effect.race(
-          Deferred.await(interrupt).pipe(
-            Effect.flatMap(() =>
-              Effect.gen(function* () {
-                const base = yield* makeBase(session.threadId, turnId);
-                yield* publish({
-                  ...base,
-                  type: "turn.completed",
-                  payload: { state: "interrupted", stopReason: "interrupted" },
-                } satisfies ProviderRuntimeEvent);
-              }),
+    return yield* Effect.gen(function* () {
+      const launch = yield* context.promptLock.withPermit(
+        Effect.gen(function* () {
+          yield* requireSession(input.threadId);
+          const turnId = context.activeTurnId ?? TurnId.make(yield* randomId);
+          const steering = context.activeTurnId !== undefined;
+          const turn: TurnIntent = { turnId, generation: ++context.generation, settled: false };
+          intent = turn;
+          context.activeTurnId = turnId;
+          if (!steering) {
+            yield* emit({
+              type: "turn.started",
+              ...(yield* stamp),
+              provider: PROVIDER,
+              threadId: input.threadId,
+              turnId,
+              payload: {},
+            });
+          }
+          if (context.promptFiber) {
+            yield* cancelRequests(context);
+            yield* context.runtime.cancel;
+            yield* Fiber.await(context.promptFiber);
+          }
+          context.session = {
+            ...context.session,
+            status: "running",
+            activeTurnId: turnId,
+            updatedAt: yield* nowIso,
+          };
+          const dispatched = yield* Deferred.make<void>();
+          const fiber = yield* context.runtime
+            .prompt(
+              {
+                prompt: [
+                  { type: "text", text: promptText },
+                  { type: "text", text: buildRuntimeInstructions({ harness: "Bob Shell" }) },
+                ],
+              },
+              { dispatched },
+            )
+            .pipe(Effect.forkIn(context.scope));
+          context.promptFiber = fiber;
+          yield* Effect.raceFirst(
+            Deferred.await(dispatched),
+            Fiber.await(fiber).pipe(
+              Effect.flatMap((exit) => exit),
+              Effect.asVoid,
             ),
-          ),
-        ),
-        Effect.forkIn(adapterScope),
+          );
+          return { turn, fiber };
+        }),
       );
-      session.activeFiber = turnFiber;
-
+      const result = yield* Fiber.await(launch.fiber).pipe(Effect.flatMap((exit) => exit));
+      yield* context.runtime.drainEvents;
+      if (context.stopped) {
+        return yield* new ProviderAdapterSessionClosedError({
+          provider: PROVIDER,
+          threadId: input.threadId,
+        });
+      }
+      const record = context.turns.find((t) => t.id === launch.turn.turnId);
+      if (record) record.items.push(result);
+      else context.turns.push({ id: launch.turn.turnId, items: [result] });
+      yield* context.promptLock.withPermit(
+        finishTurn(launch.turn, {
+          state: result.stopReason === "cancelled" ? "cancelled" : "completed",
+          stopReason: result.stopReason,
+        }),
+      );
       return {
         threadId: input.threadId,
-        turnId,
-      } as const;
-    }).pipe(Effect.mapError((e) => e as ProviderAdapterError));
-
-  const interruptTurn: ProviderAdapterShape<ProviderAdapterError>["interruptTurn"] = (
-    threadId,
-    _turnId,
-  ) =>
-    Effect.gen(function* () {
-      const session = sessions.get(threadId);
-      if (!session) return;
-      if (session.activeChildProcess) {
-        yield* session.activeChildProcess.kill({ forceKillAfter: "1 second" }).pipe(Effect.ignore);
-        session.activeChildProcess = undefined;
-      }
-      if (session.interruptRef) {
-        yield* Deferred.succeed(session.interruptRef, undefined);
-      }
-      if (session.activeFiber) {
-        yield* Fiber.interrupt(session.activeFiber).pipe(Effect.ignore);
-      }
-    }).pipe(Effect.mapError((e) => e as ProviderAdapterError));
-
-  const stopSession: ProviderAdapterShape<ProviderAdapterError>["stopSession"] = (threadId) =>
-    Effect.gen(function* () {
-      const session = sessions.get(threadId);
-      if (!session) return;
-      yield* interruptTurn(threadId);
-      sessions.delete(threadId);
-      const base = yield* makeBase(threadId);
-      yield* publish({
-        ...base,
-        type: "session.exited",
-        payload: {},
-      } satisfies ProviderRuntimeEvent);
-    }).pipe(Effect.mapError((e) => e as ProviderAdapterError));
-
-  const respondToRequest: ProviderAdapterShape<ProviderAdapterError>["respondToRequest"] = () =>
-    Effect.fail(
-      new ProviderAdapterRequestError({
-        provider: PROVIDER,
-        method: "respondToRequest",
-        detail: "Not supported.",
-      }),
+        turnId: launch.turn.turnId,
+        resumeCursor: context.session.resumeCursor,
+      };
+    }).pipe(
+      Effect.mapError((cause) =>
+        isAcpError(cause) ? mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", cause) : cause,
+      ),
+      Effect.tapError((cause) =>
+        Effect.suspend(() =>
+          intent
+            ? context.promptLock.withPermit(
+                finishTurn(intent, {
+                  state: "failed",
+                  errorMessage: (cause as { message?: string }).message ?? String(cause),
+                }),
+              )
+            : Effect.void,
+        ),
+      ),
+      Effect.onInterrupt(() =>
+        context.promptLock.withPermit(
+          Effect.gen(function* () {
+            const turn = intent;
+            if (!turn || turn.settled || context.stopped || context.generation !== turn.generation) return;
+            const promptFiber = context.promptFiber;
+            yield* cancelRequests(context);
+            yield* Effect.ignore(context.runtime.cancel);
+            if (promptFiber) yield* Fiber.interrupt(promptFiber);
+            yield* finishTurn(turn, { state: "cancelled", stopReason: "cancelled" });
+          }),
+        ),
+      ),
     );
+  });
 
-  const respondToUserInput: ProviderAdapterShape<ProviderAdapterError>["respondToUserInput"] = () =>
-    Effect.fail(
-      new ProviderAdapterRequestError({
-        provider: PROVIDER,
-        method: "respondToUserInput",
-        detail: "Bob Shell does not support interactive user-input requests.",
-      }),
-    );
-
-  const listSessions: ProviderAdapterShape<ProviderAdapterError>["listSessions"] = () =>
-    DateTime.now.pipe(
-      Effect.orDie,
-      Effect.map((now) => {
-        const nowStr = DateTime.formatIso(now);
-        return Array.from(sessions.values()).map((s): ProviderSession => ({
-          provider: PROVIDER,
-          providerInstanceId: options.instanceId,
-          status: s.activeTurnId ? "running" : "ready",
-          runtimeMode: s.runtimeMode,
-          cwd: s.cwd,
-          threadId: s.threadId,
-          activeTurnId: s.activeTurnId,
-          createdAt: s.createdAt,
-          updatedAt: nowStr,
-        }));
-      }),
-    );
-
-  const hasSession: ProviderAdapterShape<ProviderAdapterError>["hasSession"] = (threadId) =>
-    Effect.succeed(sessions.has(threadId));
-
-  const readThread: ProviderAdapterShape<ProviderAdapterError>["readThread"] = (threadId) =>
+  const interruptTurn: ProviderAdapterShape<ProviderAdapterError>["interruptTurn"] = (threadId) =>
     Effect.gen(function* () {
-      // Bob v2 stores conversation history in its internal SQLite database.
-      // This is not accessible via the CLI, so we always return an empty snapshot.
-      // T3 Code checkpoints serve as the rollback mechanism instead.
-      return { threadId, turns: [] } satisfies ProviderThreadSnapshot;
+      const context = yield* requireSession(threadId);
+      yield* context.promptLock
+        .withPermit(
+          Effect.gen(function* () {
+            yield* cancelRequests(context);
+            yield* context.runtime.cancel;
+          }),
+        )
+        .pipe(
+          Effect.mapError((cause) => mapAcpToAdapterError(PROVIDER, threadId, "session/cancel", cause)),
+        );
     });
 
-  const rollbackThread: ProviderAdapterShape<ProviderAdapterError>["rollbackThread"] = (threadId) =>
-    Effect.succeed({ threadId, turns: [] } satisfies ProviderThreadSnapshot);
+  const respondToRequest: ProviderAdapterShape<ProviderAdapterError>["respondToRequest"] = (
+    threadId,
+    requestId,
+    decision,
+  ) =>
+    Effect.gen(function* () {
+      const context = yield* requireSession(threadId);
+      const pending = context.approvals.get(requestId);
+      if (!pending) {
+        return yield* new ProviderAdapterRequestError({
+          provider: PROVIDER,
+          method: "session/request_permission",
+          detail: "This approval request is no longer pending.",
+        });
+      }
+      const optionId =
+        decision === "cancel"
+          ? undefined
+          : pending.request.options.find(
+              (o) =>
+                o.kind ===
+                (decision === "acceptForSession"
+                  ? "allow_always"
+                  : decision === "accept"
+                    ? "allow_once"
+                    : "reject_once"),
+            )?.optionId ?? pending.request.options[0]?.optionId;
+      yield* Deferred.succeed(pending.response, {
+        decision,
+        result: {
+          outcome:
+            optionId === undefined ? { outcome: "cancelled" } : { outcome: "selected", optionId },
+        },
+      });
+    });
+
+  const respondToUserInput: ProviderAdapterShape<ProviderAdapterError>["respondToUserInput"] = (
+    threadId,
+    requestId,
+    answers,
+  ) =>
+    Effect.gen(function* () {
+      const context = yield* requireSession(threadId);
+      const pending = context.questions.get(requestId);
+      if (!pending) {
+        return yield* new ProviderAdapterRequestError({
+          provider: PROVIDER,
+          method: "session/request_permission",
+          detail: "This question is no longer pending.",
+        });
+      }
+      yield* Deferred.succeed(pending.response, {
+        answers,
+        result: { outcome: { outcome: "cancelled" } },
+      });
+    });
+
+  const stopSession: ProviderAdapterShape<ProviderAdapterError>["stopSession"] = (threadId) =>
+    withThreadLock(threadId, Effect.flatMap(requireSession(threadId), stopContext));
 
   const stopAll: ProviderAdapterShape<ProviderAdapterError>["stopAll"] = () =>
-    Effect.forEach(Array.from(sessions.keys()), (threadId) => stopSession(threadId as ThreadId), {
-      concurrency: "unbounded",
-    }).pipe(Effect.asVoid);
+    Effect.forEach([...sessions.values()], stopContext, { discard: true });
 
-  const streamEvents: ProviderAdapterShape<ProviderAdapterError>["streamEvents"] =
-    Stream.fromPubSub(eventPubSub);
+  yield* Effect.addFinalizer(() =>
+    stopAll().pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterrupts(cause)
+          ? Effect.void
+          : Effect.logError("Could not stop a Bob Shell session."),
+      ),
+      Effect.ensuring(PubSub.shutdown(events)),
+    ),
+  );
 
   return {
     provider: PROVIDER,
@@ -812,11 +769,28 @@ export const makeBobShellAdapter = Effect.fn("makeBobShellAdapter")(function* (
     respondToRequest,
     respondToUserInput,
     stopSession,
-    listSessions,
-    hasSession,
-    readThread,
-    rollbackThread,
     stopAll,
-    streamEvents,
+    listSessions: () =>
+      Effect.sync(() =>
+        [...sessions.values()]
+          .filter((ctx) => !ctx.stopped)
+          .map((ctx) => ({ ...ctx.session })),
+      ),
+    hasSession: (threadId) =>
+      Effect.sync(() => sessions.has(threadId) && !sessions.get(threadId)?.stopped),
+    readThread: (threadId) =>
+      Effect.map(requireSession(threadId), (ctx) => ({
+        threadId,
+        turns: ctx.turns,
+      } satisfies ProviderThreadSnapshot)),
+    rollbackThread: (_threadId: ThreadId, _numTurns: number) =>
+      Effect.fail(
+        new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "rollbackThread",
+          issue: "Bob Shell does not support conversation rewind. Start a new thread instead.",
+        }),
+      ),
+    streamEvents: Stream.fromPubSub(events),
   } satisfies BobShellAdapterShape;
 });

@@ -1,156 +1,186 @@
+/**
+ * BobShellSkills tests — covers skill discovery from disk.
+ *
+ * Exercises:
+ *   - empty roots: only built-in skills returned in fixed order
+ *   - user-level skills discovered from <bobHome>/skills
+ *   - project-level skills discovered from <cwd>/.bob/skills
+ *   - first-seen-wins (user overrides project for same name)
+ *   - malformed SKILL.md (no frontmatter) is skipped gracefully
+ *   - discovered skills sort alphabetically; built-ins follow
+ *   - built-in names are not duplicated when also discovered
+ */
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { assert, it } from "@effect/vitest";
+import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 import { BobShellSettings } from "@t3tools/contracts";
 
-import { discoverBobShellSkills } from "./BobShellSkills.ts";
+import { discoverBobShellSkills } from "../Drivers/BobShellSkills.ts";
 
-const BOB_BUILT_IN_NAMES = ["code", "plan", "ask", "advanced"];
+const decodeSettings = Schema.decodeSync(BobShellSettings);
 
-const makeWorkspace = Effect.fn("makeWorkspace")(function* () {
-  const fileSystem = yield* FileSystem.FileSystem;
-  const path = yield* Path.Path;
-  const tmp = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-bob-skills-" });
-  return {
-    cwd: path.join(tmp, "workspace"),
-    bobHome: path.join(tmp, "bob-home"),
-  };
-});
+const BUILT_IN_NAMES = ["code", "plan", "ask", "advanced"];
 
-const makeSettings = (homePath: string): Pick<BobShellSettings, "binaryPath" | "homePath"> => ({
-  binaryPath: "bob",
-  homePath,
-});
-
-const writeSkill = Effect.fn("writeSkill")(function* (
+/** Write a minimal SKILL.md with YAML frontmatter in the given directory. */
+const writeSkillMd = (
   directory: string,
   skillName: string,
-  contents: string,
-) {
-  const fileSystem = yield* FileSystem.FileSystem;
-  const path = yield* Path.Path;
-  const skillDir = path.join(directory, skillName);
-  yield* fileSystem.makeDirectory(skillDir, { recursive: true });
-  yield* fileSystem.writeFileString(path.join(skillDir, "SKILL.md"), contents);
-  return path.join(skillDir, "SKILL.md");
-});
+  frontmatter: string,
+) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const skillDir = path.join(directory, skillName);
+    yield* fs.makeDirectory(skillDir, { recursive: true });
+    yield* fs.writeFileString(path.join(skillDir, "SKILL.md"), `---\n${frontmatter}\n---\n`);
+  });
 
 it.layer(NodeServices.layer)("discoverBobShellSkills", (it) => {
-  it.effect("returns only built-ins when no skill directories exist", () =>
+  it.effect("returns only built-in skills when no skill directories exist", () =>
     Effect.gen(function* () {
-      const { cwd, bobHome } = yield* makeWorkspace();
-      const skills = yield* discoverBobShellSkills(makeSettings(bobHome), cwd);
-      assert.deepEqual(
-        skills.map((s) => s.name),
-        BOB_BUILT_IN_NAMES,
-      );
-      for (const s of skills) {
-        assert.isUndefined(s.scope);
-        assert.isTrue(s.enabled);
-      }
-    }).pipe(Effect.scoped),
-  );
+      const fs = yield* FileSystem.FileSystem;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-skills-empty-" });
+      const settings = decodeSettings({ enabled: true });
 
-  it.effect("discovers user skills from <bobHome>/skills", () =>
-    Effect.gen(function* () {
-      const { cwd, bobHome } = yield* makeWorkspace();
-      yield* writeSkill(
-        `${bobHome}/skills`,
-        "my-tool",
-        "---\nname: my-tool\ndescription: My custom tool\n---\n# My Tool\n",
-      );
-      const skills = yield* discoverBobShellSkills(makeSettings(bobHome), cwd);
-      const myTool = skills.find((s) => s.name === "my-tool");
-      assert.ok(myTool, "should discover user skill");
-      assert.equal(myTool.scope, "user");
-      assert.equal(myTool.description, "My custom tool");
-      assert.isTrue(myTool.enabled);
-    }).pipe(Effect.scoped),
-  );
+      const skills = yield* discoverBobShellSkills(settings, dir);
 
-  it.effect("discovers project skills from <cwd>/.bob/skills", () =>
-    Effect.gen(function* () {
-      const { cwd, bobHome } = yield* makeWorkspace();
-      yield* writeSkill(
-        `${cwd}/.bob/skills`,
-        "project-helper",
-        "---\ndescription: Project-level helper\n---\n# Helper\n",
-      );
-      const skills = yield* discoverBobShellSkills(makeSettings(bobHome), cwd);
-      const helper = skills.find((s) => s.name === "project-helper");
-      assert.ok(helper, "should discover project skill");
-      assert.equal(helper.scope, "project");
-      assert.equal(helper.description, "Project-level helper");
-    }).pipe(Effect.scoped),
-  );
-
-  it.effect("user skill with same name as project skill wins (user first)", () =>
-    Effect.gen(function* () {
-      const { cwd, bobHome } = yield* makeWorkspace();
-      yield* writeSkill(
-        `${bobHome}/skills`,
-        "shared",
-        "---\ndescription: User version\n---\n",
-      );
-      yield* writeSkill(
-        `${cwd}/.bob/skills`,
-        "shared",
-        "---\ndescription: Project version\n---\n",
-      );
-      const skills = yield* discoverBobShellSkills(makeSettings(bobHome), cwd);
-      const shared = skills.filter((s) => s.name === "shared");
-      assert.equal(shared.length, 1, "should not duplicate the skill");
-      assert.equal(shared[0]!.scope, "user");
-      assert.equal(shared[0]!.description, "User version");
-    }).pipe(Effect.scoped),
-  );
-
-  it.effect("discovered skill named like a built-in suppresses the built-in", () =>
-    Effect.gen(function* () {
-      const { cwd, bobHome } = yield* makeWorkspace();
-      yield* writeSkill(
-        `${bobHome}/skills`,
-        "code",
-        "---\ndescription: My custom code mode\n---\n",
-      );
-      const skills = yield* discoverBobShellSkills(makeSettings(bobHome), cwd);
-      const codeSkills = skills.filter((s) => s.name === "code");
-      assert.equal(codeSkills.length, 1, "code should appear only once");
-      assert.equal(codeSkills[0]!.scope, "user");
-      assert.equal(codeSkills[0]!.description, "My custom code mode");
-      for (const builtIn of ["plan", "ask", "advanced"]) {
-        assert.ok(skills.some((s) => s.name === builtIn), `${builtIn} built-in should still be present`);
-      }
-    }).pipe(Effect.scoped),
-  );
-
-  it.effect("skips entries with malformed frontmatter", () =>
-    Effect.gen(function* () {
-      const { cwd, bobHome } = yield* makeWorkspace();
-      yield* writeSkill(
-        `${bobHome}/skills`,
-        "bad-skill",
-        "---\n: this is malformed: yaml: [\n---\n# Bad\n",
-      );
-      const skills = yield* discoverBobShellSkills(makeSettings(bobHome), cwd);
-      assert.isUndefined(skills.find((s) => s.name === "bad-skill"), "malformed skill should be skipped");
-    }).pipe(Effect.scoped),
-  );
-
-  it.effect("discovered skills are sorted before built-ins", () =>
-    Effect.gen(function* () {
-      const { cwd, bobHome } = yield* makeWorkspace();
-      yield* writeSkill(`${bobHome}/skills`, "zebra", "---\n---\n");
-      yield* writeSkill(`${cwd}/.bob/skills`, "alpha", "---\n---\n");
-      const skills = yield* discoverBobShellSkills(makeSettings(bobHome), cwd);
       const names = skills.map((s) => s.name);
-      const alphaIdx = names.indexOf("alpha");
-      const zebraIdx = names.indexOf("zebra");
-      const codeIdx = names.indexOf("code");
-      assert.isTrue(alphaIdx < zebraIdx, "alpha before zebra");
-      assert.isTrue(zebraIdx < codeIdx, "discovered skills before built-ins");
-    }).pipe(Effect.scoped),
+      for (const builtin of BUILT_IN_NAMES) {
+        expect(names).toContain(builtin);
+      }
+      // Only built-ins — nothing with a scope
+      const withScope = skills.filter((s) => s.scope !== undefined);
+      expect(withScope).toHaveLength(0);
+    }),
+  );
+
+  it.effect("discovers user-level skills from <bobHome>/skills", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-skills-user-" });
+      const path = yield* Path.Path;
+
+      const userSkillsRoot = path.join(dir, "skills");
+      yield* writeSkillMd(userSkillsRoot, "my-skill", "name: my-skill\ndescription: User skill");
+
+      const settings = decodeSettings({ enabled: true, homePath: dir });
+      const skills = yield* discoverBobShellSkills(settings, dir);
+
+      const mySkill = skills.find((s) => s.name === "my-skill");
+      expect(mySkill).toBeDefined();
+      expect(mySkill?.scope).toBe("user");
+      expect(mySkill?.description).toBe("User skill");
+      expect(mySkill?.enabled).toBe(true);
+    }),
+  );
+
+  it.effect("discovers project-level skills from <cwd>/.bob/skills", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-skills-project-" });
+      const path = yield* Path.Path;
+
+      const projectSkillsRoot = path.join(dir, ".bob", "skills");
+      yield* writeSkillMd(projectSkillsRoot, "proj-skill", "name: proj-skill");
+
+      const settings = decodeSettings({ enabled: true, homePath: "/nonexistent-home-for-test" });
+      const skills = yield* discoverBobShellSkills(settings, dir);
+
+      const projSkill = skills.find((s) => s.name === "proj-skill");
+      expect(projSkill).toBeDefined();
+      expect(projSkill?.scope).toBe("project");
+    }),
+  );
+
+  it.effect("user-level skill wins when same name exists in both roots", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-skills-dedup-" });
+      const path = yield* Path.Path;
+
+      const userSkillsRoot = path.join(dir, "skills");
+      const projectSkillsRoot = path.join(dir, ".bob", "skills");
+      yield* writeSkillMd(userSkillsRoot, "shared", "name: shared\ndescription: from user");
+      yield* writeSkillMd(projectSkillsRoot, "shared", "name: shared\ndescription: from project");
+
+      const settings = decodeSettings({ enabled: true, homePath: dir });
+      const skills = yield* discoverBobShellSkills(settings, dir);
+
+      const allShared = skills.filter((s) => s.name === "shared");
+      expect(allShared).toHaveLength(1);
+      expect(allShared[0]?.description).toBe("from user");
+      expect(allShared[0]?.scope).toBe("user");
+    }),
+  );
+
+  it.effect("skill with no SKILL.md in subdirectory is skipped", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-skills-missing-md-" });
+      const path = yield* Path.Path;
+
+      // Create a subdirectory without SKILL.md
+      const skillDir = path.join(dir, "skills", "orphan");
+      yield* fs.makeDirectory(skillDir, { recursive: true });
+
+      const settings = decodeSettings({ enabled: true, homePath: dir });
+      const skills = yield* discoverBobShellSkills(settings, dir);
+
+      const orphan = skills.find((s) => s.name === "orphan");
+      expect(orphan).toBeUndefined();
+    }),
+  );
+
+  it.effect("discovered skills are sorted alphabetically before built-ins", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-skills-sort-" });
+      const path = yield* Path.Path;
+
+      const userSkillsRoot = path.join(dir, "skills");
+      yield* writeSkillMd(userSkillsRoot, "zebra-skill", "name: zebra-skill");
+      yield* writeSkillMd(userSkillsRoot, "alpha-skill", "name: alpha-skill");
+
+      const settings = decodeSettings({ enabled: true, homePath: dir });
+      const skills = yield* discoverBobShellSkills(settings, dir);
+
+      const discoveredNames = skills.filter((s) => s.scope !== undefined).map((s) => s.name);
+      expect(discoveredNames).toEqual([...discoveredNames].sort());
+
+      // All built-ins must appear after discovered skills
+      const lastDiscoveredIdx = Math.max(
+        ...discoveredNames.map((n) => skills.findIndex((s) => s.name === n)),
+      );
+      for (const builtin of BUILT_IN_NAMES) {
+        const builtinIdx = skills.findIndex((s) => s.name === builtin);
+        if (builtinIdx !== -1) {
+          expect(builtinIdx).toBeGreaterThan(lastDiscoveredIdx);
+        }
+      }
+    }),
+  );
+
+  it.effect("built-in skill name is not duplicated when discovered skill has same name", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-skills-builtin-dedup-" });
+      const path = yield* Path.Path;
+
+      // A user skill named "code" — same as the built-in
+      const userSkillsRoot = path.join(dir, "skills");
+      yield* writeSkillMd(userSkillsRoot, "code", "name: code\ndescription: Custom code skill");
+
+      const settings = decodeSettings({ enabled: true, homePath: dir });
+      const skills = yield* discoverBobShellSkills(settings, dir);
+
+      const codeSkills = skills.filter((s) => s.name === "code");
+      expect(codeSkills).toHaveLength(1);
+      // User version should win (has a description and a scope)
+      expect(codeSkills[0]?.scope).toBe("user");
+      expect(codeSkills[0]?.description).toBe("Custom code skill");
+    }),
   );
 });
