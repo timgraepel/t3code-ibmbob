@@ -27,6 +27,7 @@ squashfs-root/
 .vercel
 .gstack/
 .plans/
+.bob/
 dist-electron/
 .electron-runtime/
 .showcase/
